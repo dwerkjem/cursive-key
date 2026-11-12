@@ -9,6 +9,8 @@ _Researched 2026-11-12 for [issue #7](https://github.com/dwerkjem/cursive-key/is
 - **At about 10,000 signed-in Learners a day, Worker requests average about 60% of the 100,000/day cap.** That leaves no room for spikes or error storms, so this is the point to move to Workers Paid. Everything still fits in Paid's included amounts, so the bill is a flat $5/month.
 - **Storing progress as one D1 row per card plus a review log breaks Free at about 400 signed-in Learners a day** (D1 writes). At 10,000 a day it also breaks the $20 cap on Paid. Avoid that design.
 - **Free plans fail hard. Paid plans bill.** Cloudflare has no spending cap. Budget alerts only send email (Pay-as-you-go accounts only, informational, about one day late), so any real cap has to be built into the app.
+- **One write budget is shared by everything.** The 100,000 rows/day D1 write limit and the 100,000 requests/day Worker limit apply to the whole account. Progress sync, Personal Settings, Access Requests, Feedback, Error Reports, migrations and (very likely) Previews all draw on them. Proposed split: progress and settings 60,000; Error Reports a hard cap of 5,000; Feedback 2,000; Access Requests 1,000; Previews and CI 5,000; and about 27,000 kept in reserve.
+- **Previews:** preview D1 databases are ordinary D1 databases in the same account, so they share the account's daily row limits, its 10-database limit and its 5 GB of storage. No Cloudflare page says whether requests to Preview URLs count toward the 100,000/day Worker limit (unverified, but likely).
 
 ## Primary sources
 
@@ -35,6 +37,8 @@ _Researched 2026-11-12 for [issue #7](https://github.com/dwerkjem/cursive-key/is
 | [Workers Logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/) | 2026-10-12 |
 | [Observability pricing (from 2026-12-01)](https://developers.cloudflare.com/observability/pricing/) | 2026-11-11 |
 | [WHATWG Fetch standard: HTTP-network-or-cache fetch, keepalive quota](https://fetch.spec.whatwg.org/#http-network-or-cache-fetch) | living standard |
+| [Workers Previews](https://developers.cloudflare.com/workers/previews/) | 2026-09-24 |
+| [Workers Previews: resources and isolation](https://developers.cloudflare.com/workers/previews/resources/) | 2026-11-09 |
 
 ## The limits that matter
 
@@ -192,6 +196,54 @@ Compress the blob, and keep long review history out of it or cap it. On Paid, th
    - Apply a server-side daily cap and sampling to Error Reports, and apply the issue #10 limits to Feedback and Access Requests.
    - An app-level cap is the only spending cap available on Paid.
 8. **Keep review history out of the hot path.** If FSRS parameter optimisation needs review logs later, add one compressed batch per session to the same row, or one row per session. Never one row per review.
+
+## Splitting the shared daily budget
+
+### The limits are per account
+
+- **Worker requests:** "Accounts on the Workers Free plan have a daily request limit of 100,000 requests" ([Workers limits](https://developers.cloudflare.com/workers/platform/limits/)).
+- **D1 rows:** the enforcement changelog talks only about the account. Queries fail when "an account exceeds the daily row read or row write limits", and the error reads "Your account has exceeded D1's free tier daily row read limit" ([changelog](https://developers.cloudflare.com/changelog/post/2026-09-01-d1-free-tier-limit-enforcement/)).
+- **What the pricing and limits pages don't say:** neither states the per-account scope for daily rows. They do say storage is "the sum of all databases in your account" ([D1 pricing](https://developers.cloudflare.com/d1/platform/pricing/)).
+- **Consequence:** every endpoint, every database (production, preview and test) and every migration shares the same 100,000 rows written, 5M rows read and 100,000 Worker requests per day. One noisy writer can stop progress sync for everyone until 00:00 UTC.
+
+### Proposed split of the 100,000 rows written per day (Free, design A)
+
+| Bucket | Budget/day | Enforced how | Expected use at 10,000 Learners/day |
+|---|---|---|---|
+| Progress sync + Personal Settings | 60,000 (soft) | Not capped: this is the core feature. Passing it is the trigger to upgrade. | ~30,000 |
+| **Error Reports** | **5,000 (hard)** | Daily quota row, below | ≤ 5,000 |
+| Feedback (all three kinds) | 2,000 (hard) | Same quota mechanism | ~300 |
+| Access Requests | 1,000 (hard) | Same; Closed Beta only | ~40 |
+| Admin actions (Roles, Promote, removals) | not capped | Rare and done by people | < 500 |
+| Previews and CI test databases | 5,000 (by test design) | Small seed data, one shared preview database | unknown |
+| Reserve | ~27,000 | Spikes, retries, migrations | — |
+
+The reserve matters for migrations. Building an index "writes a row for every row it indexes" ([indexes](https://developers.cloudflare.com/d1/best-practices/use-indexes/)). Any migration that rewrites the progress table writes one row per Person, which is 30,000 at the 10,000/day scale. Run big migrations just after 00:00 UTC, or on Paid.
+
+### Error Report endpoint: a daily cap that costs almost nothing when it is full
+
+This uses our own D1 capture, with one row per grouped error.
+
+1. **Group row.** `error_groups(signature TEXT PRIMARY KEY, first_seen, last_seen, count, sample)`.
+   - The first time a signature appears, the insert costs 2 rows written: the table and the primary-key index of the rowid table.
+   - Each repeat is an `UPDATE` of `count`/`last_seen` only, which costs 1 row written because no indexed column changes.
+2. **Quota row.** `quota(day TEXT, bucket TEXT, used INTEGER, PRIMARY KEY (day, bucket))`. Before writing, run `UPDATE quota SET used = used + 1 WHERE day = ?1 AND bucket = 'error' AND used < ?2`, then the group upsert in the same `batch()`. The quota row for each day and bucket is created with one `INSERT OR IGNORE` on the first call of the day.
+   - If the update changed no rows, the quota is spent. Return 202 and drop the report. That costs 1 row read and 0 rows written.
+   - An accepted report costs about 2–3 rows written (the quota row plus the group row, plus its index for a new signature). So set `?2` to **2,000 reports**, which keeps the bucket at about 5,000 rows.
+3. **Count each occurrence once per session.** The browser sends each error signature once per session (and the Worker reports its own errors the same way). The `count` column then means "sessions affected", not "times thrown". This is what keeps a bug that fires on every page from turning into 10,000 × N writes.
+4. **Rejected reports still cost one Worker request each.** The D1 cap protects the write budget but not the request budget. Only the browser-side dedupe and sampling protect the 100,000 requests/day, and the issue #10 limits protect it against abuse. On Paid, a request flood bills $0.30 per million rather than failing.
+
+Feedback and Access Requests use the same quota row with their own `bucket`, plus Turnstile and the issue #10 limits.
+
+## Previews and their D1 databases
+
+- **Where Previews run:** Previews are "an isolated, production-like environment under the same Worker" ([Previews](https://developers.cloudflare.com/workers/previews/)). Free allows 100 Previews per Worker and 100 deployments per Preview. "Preview URLs are public by default"; the page says to put Cloudflare Access in front of them.
+- **Preview databases:** a preview D1 database is an ordinary D1 binding. "Two Previews sharing the same `database_id` share rows." The base branch can "configure one staging database that all Previews share by default", and a branch can override it ([resources and isolation](https://developers.cloudflare.com/workers/previews/resources/)). Those databases sit in the same account, so on Free:
+  - **they count toward the 10-database limit**, which rules out a separate database for every PR (production + 9 at most);
+  - they share the account's 5 GB of storage;
+  - they draw on the account's daily row limits, going by the account-level wording of the D1 enforcement changelog above.
+- **Preview requests:** **Unverified.** Neither the [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/) page nor the Previews pages say whether Preview URL requests count toward the 100,000/day Free limit or Paid's 10M/month. The limit is worded per account and Previews run "under the same Worker", so assume they count until shown otherwise. A test on a throwaway account would settle it (compare the account's request metrics before and after hitting a Preview).
+- **For issue #5:** use one shared preview database with small seed data, and delete Previews when their PR closes (`wrangler preview delete`). Size the end-to-end suite so preview traffic stays within the 5,000 rows/day bucket above. Requests are hard to estimate before the suite exists, but three browsers × a few dozen tests × a few API calls is in the low thousands per PR run.
 
 ## Checking `doc/architecture.md`'s free-tier table
 
