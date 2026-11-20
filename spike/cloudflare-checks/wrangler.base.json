@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ck16-checks",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-11-01",
+  "workers_dev": true,
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/secret/*"]
+  },
+  "d1_databases": [
+    { "binding": "DB", "database_name": "ck16-db", "database_id": "__D1_ID__" }
+  ],
+  "previews": {
+    "d1_databases": [
+      { "binding": "DB", "database_name": "ck16-db", "database_id": "__D1_ID__" }
+    ]
+  },
+  "routes": [{ "pattern": "__HOST__", "custom_domain": true }]
+}
