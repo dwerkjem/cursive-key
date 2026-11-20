@@ -27,3 +27,4 @@ All project documents live in [`doc/`](doc/):
 | [doc/data-sources.md](doc/data-sources.md) | Where real handwriting examples come from, and their rights |
 | [doc/architecture.md](doc/architecture.md) | $0 Cloudflare architecture, data storage, and free-tier limits |
 | [doc/roadmap.md](doc/roadmap.md) | Phased build plan, starting with a prototype |
+| [doc/agents/](doc/agents/) | Configuration for coding-agent skills (issue tracker, triage labels, domain docs) |
