@@ -1,0 +1,8 @@
+{
+  "name": "ck16-cloudflare-checks",
+  "private": true,
+  "description": "Throwaway checks for issue #16. Not part of the site.",
+  "devDependencies": {
+    "wrangler": "4.158.0"
+  }
+}
